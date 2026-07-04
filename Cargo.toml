@@ -1,0 +1,12 @@
+[package]
+name = "todo-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+ratatui = "0.28"
+crossterm = "0.28"
+anyhow = "1"
+dirs = "5"
