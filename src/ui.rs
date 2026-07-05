@@ -77,7 +77,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection)
                 KeyCode::Enter => {
                     if selected_index < tasks.len() {
                         let task = db::get_task(conn, tasks[selected_index].id)?;
+                        // Restore terminal before launching external editor
+                        disable_raw_mode()?;
+                        execute!(io::stdout(), LeaveAlternateScreen)?;
                         let new_detail = crate::editor::edit(&task.detail)?;
+                        // Re-enter TUI mode after editor exits
+                        enable_raw_mode()?;
+                        execute!(io::stdout(), EnterAlternateScreen)?;
+                        terminal.clear()?;
                         db::update_detail(conn, task.id, &new_detail)?;
                         tasks = db::list_tasks(conn)?;
                         if !tasks.is_empty() && selected_index >= tasks.len() {
