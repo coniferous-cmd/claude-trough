@@ -13,8 +13,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Add a new task
+    /// Add a new task (to top of list)
     Add {
+        /// Task title
+        title: String,
+        /// Priority (0-3, higher = more important)
+        #[arg(short, long, default_value_t = 0)]
+        priority: i64,
+    },
+    /// Push a new task (to bottom of list)
+    Push {
         /// Task title
         title: String,
         /// Priority (0-3, higher = more important)
@@ -52,6 +60,10 @@ pub fn run(conn: &Connection) -> Result<()> {
         Command::Add { title, priority } => {
             let task = db::add_task(conn, &title, priority)?;
             println!("Added task #{}: {}", task.id, task.title);
+        }
+        Command::Push { title, priority } => {
+            let task = db::push_task(conn, &title, priority)?;
+            println!("Pushed task #{}: {}", task.id, task.title);
         }
         Command::List => {
             let tasks = db::list_tasks(conn)?;

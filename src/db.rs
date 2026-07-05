@@ -75,6 +75,20 @@ pub fn add_task(conn: &Connection, title: &str, priority: i64) -> Result<Task> {
     get_task(conn, id)
 }
 
+pub fn push_task(conn: &Connection, title: &str, priority: i64) -> Result<Task> {
+    let mut task = Task::new(title);
+    task.priority = priority;
+    task.created_at = 0; // push to bottom via old timestamp
+    task.updated_at = 0;
+    conn.execute(
+        "INSERT INTO task (title, detail, priority, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![task.title, task.detail, task.priority, task.created_at, task.updated_at],
+    )
+    .context("failed to insert task")?;
+    let id = conn.last_insert_rowid();
+    get_task(conn, id)
+}
+
 pub fn list_tasks(conn: &Connection) -> Result<Vec<Task>> {
     let mut stmt = conn
         .prepare("SELECT id, title, done, detail, priority, created_at, updated_at FROM task ORDER BY priority DESC, created_at DESC")
