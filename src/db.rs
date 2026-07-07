@@ -1,19 +1,37 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::models::Task;
 
 fn db_path() -> Result<PathBuf> {
+    let config = dirs::config_dir().context("cannot determine config directory")?;
+    let dir = config.join("trough");
+    std::fs::create_dir_all(&dir).context("failed to create config directory for trough")?;
+    Ok(dir.join("trough.db"))
+}
+
+fn old_db_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
-    let dir = home.join(".todo");
-    std::fs::create_dir_all(&dir).context("failed to create ~/.todo directory")?;
-    Ok(dir.join("todo.db"))
+    Ok(home.join(".todo").join("todo.db"))
 }
 
 pub fn init() -> Result<Connection> {
     let path = db_path()?;
+
+    // Migrate data from old ~/.todo/todo.db (todo-cli) if it exists and new path does not
+    let old_path = old_db_path()?;
+    if old_path.exists() && !path.exists() {
+        std::fs::copy(&old_path, &path)
+            .context("failed to migrate database from old ~/.todo/todo.db")?;
+        println!(
+            "Migrated database from {} to {}",
+            old_path.display(),
+            path.display()
+        );
+    }
+
     let conn = Connection::open(&path).context("failed to open database")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS task (
@@ -75,8 +93,9 @@ pub fn add_task(conn: &Connection, title: &str, priority: i64) -> Result<Task> {
     get_task(conn, id)
 }
 
-pub fn push_task(conn: &Connection, title: &str, priority: i64) -> Result<Task> {
+pub fn push_task(conn: &Connection, title: &str, detail: &str, priority: i64) -> Result<Task> {
     let mut task = Task::new(title);
+    task.detail = detail.to_string();
     task.priority = priority;
     task.created_at = 0; // push to bottom via old timestamp
     task.updated_at = 0;
@@ -101,6 +120,16 @@ pub fn list_tasks(conn: &Connection) -> Result<Vec<Task>> {
         tasks.push(row.context("failed to read task row")?);
     }
     Ok(tasks)
+}
+
+pub fn first_task(conn: &Connection) -> Result<Option<Task>> {
+    conn.query_row(
+        "SELECT id, title, done, detail, priority, created_at, updated_at FROM task ORDER BY priority DESC, created_at DESC LIMIT 1",
+        [],
+        row_to_task,
+    )
+    .optional()
+    .context("failed to query first task")
 }
 
 pub fn toggle_task(conn: &Connection, id: i64) -> Result<()> {
@@ -200,6 +229,32 @@ mod tests {
         add_task(&conn, "third", 0).unwrap();
         let tasks = list_tasks(&conn).unwrap();
         assert_eq!(tasks.len(), 3);
+    }
+
+    #[test]
+    fn test_push_task_with_detail() {
+        let conn = test_conn();
+        let task = push_task(&conn, "write docs", "include usage examples", 0).unwrap();
+
+        assert_eq!(task.title, "write docs");
+        assert_eq!(task.detail, "include usage examples");
+    }
+
+    #[test]
+    fn test_first_task_uses_list_order() {
+        let conn = test_conn();
+        add_task(&conn, "low priority", 0).unwrap();
+        add_task(&conn, "high priority", 2).unwrap();
+
+        let task = first_task(&conn).unwrap().unwrap();
+        assert_eq!(task.title, "high priority");
+    }
+
+    #[test]
+    fn test_first_task_empty() {
+        let conn = test_conn();
+        let task = first_task(&conn).unwrap();
+        assert!(task.is_none());
     }
 
     #[test]

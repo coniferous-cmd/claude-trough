@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::db;
 
 #[derive(Parser)]
-#[command(name = "todo")]
+#[command(name = "trough")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -25,12 +25,18 @@ enum Command {
     Push {
         /// Task title
         title: String,
+        /// Task detail
+        #[arg(short, long, default_value = "")]
+        detail: String,
         /// Priority (0-3, higher = more important)
         #[arg(short, long, default_value_t = 0)]
         priority: i64,
     },
     /// List all tasks
     List,
+    /// Show the first task by list order
+    #[command(alias = "first")]
+    Next,
     /// Mark a task as done
     Done {
         /// Task ID
@@ -61,8 +67,12 @@ pub fn run(conn: &Connection) -> Result<()> {
             let task = db::add_task(conn, &title, priority)?;
             println!("Added task #{}: {}", task.id, task.title);
         }
-        Command::Push { title, priority } => {
-            let task = db::push_task(conn, &title, priority)?;
+        Command::Push {
+            title,
+            detail,
+            priority,
+        } => {
+            let task = db::push_task(conn, &title, &detail, priority)?;
             println!("Pushed task #{}: {}", task.id, task.title);
         }
         Command::List => {
@@ -71,18 +81,19 @@ pub fn run(conn: &Connection) -> Result<()> {
                 println!("No tasks yet");
             } else {
                 for task in &tasks {
-                    let status = if task.done { "x" } else { " " };
-                    if task.priority > 0 {
-                        println!(
-                            "[{}] P{} {}. {}",
-                            status, task.priority, task.id, task.title
-                        );
-                    } else {
-                        println!("[{}] {}. {}", status, task.id, task.title);
-                    }
+                    print_task_line(task);
                 }
             }
         }
+        Command::Next => match db::first_task(conn)? {
+            Some(task) => {
+                print_task_line(&task);
+                if !task.detail.is_empty() {
+                    println!("{}", task.detail);
+                }
+            }
+            None => println!("No tasks yet"),
+        },
         Command::Done { id } => {
             db::toggle_task(conn, id)?;
             println!("Marked task #{} as done", id);
@@ -104,4 +115,16 @@ pub fn run(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_task_line(task: &crate::models::Task) {
+    let status = if task.done { "x" } else { " " };
+    if task.priority > 0 {
+        println!(
+            "[{}] P{} {}. {}",
+            status, task.priority, task.id, task.title
+        );
+    } else {
+        println!("[{}] {}. {}", status, task.id, task.title);
+    }
 }

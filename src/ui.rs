@@ -112,7 +112,7 @@ fn ui(f: &mut Frame, tasks: &[Task], selected_index: usize) {
         .split(f.area());
 
     // Title bar
-    let title = Paragraph::new("Todo List")
+    let title = Paragraph::new("Trough")
         .style(Style::default().add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));

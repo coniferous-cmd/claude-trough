@@ -728,7 +728,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "todo-cli"
+name = "trough"
 version = "0.1.0"
 dependencies = [
  "anyhow",

@@ -6,7 +6,7 @@ pub fn edit(initial_text: &str) -> Result<String> {
         .unwrap_or_else(|_| "vi".to_string());
 
     let tmp_dir = std::env::temp_dir();
-    let path = tmp_dir.join("todo_edit.md");
+    let path = tmp_dir.join("trough_edit.md");
 
     std::fs::write(&path, initial_text).context("failed to write to temporary file")?;
 
