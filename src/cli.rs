@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
+use std::io::{self, Write};
 
 use crate::db;
+use crate::models::ShowFilter;
 
 #[derive(Parser)]
 #[command(name = "trough")]
@@ -32,8 +34,12 @@ enum Command {
         #[arg(short, long, default_value_t = 0)]
         priority: i64,
     },
-    /// List all tasks
-    List,
+    /// List tasks (defaults to incomplete only)
+    List {
+        /// Which tasks to show: incomplete (default), completed, or all
+        #[arg(short, long, value_enum, default_value_t = ShowFilter::Incomplete)]
+        show: ShowFilter,
+    },
     /// Show the first task by list order
     First,
     /// Show and complete the next incomplete task by list order
@@ -64,11 +70,16 @@ enum Command {
 
 pub fn run(conn: &Connection) -> Result<()> {
     let cli = Cli::parse();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    dispatch_to(conn, cli.command, &mut out)
+}
 
-    match cli.command {
+fn dispatch_to<W: Write>(conn: &Connection, command: Command, out: &mut W) -> Result<()> {
+    match command {
         Command::Add { title, priority } => {
             let task = db::add_task(conn, &title, priority)?;
-            println!("Added task #{}: {}", task.id, task.title);
+            writeln!(out, "Added task #{}: {}", task.id, task.title)?;
         }
         Command::Push {
             title,
@@ -77,59 +88,55 @@ pub fn run(conn: &Connection) -> Result<()> {
         } => {
             db::push_task(conn, &title, &detail, priority)?;
         }
-        Command::List => {
-            let tasks = db::list_tasks(conn)?;
+        Command::List { show } => {
+            let tasks = db::list_tasks(conn, show)?;
             for task in &tasks {
-                print_task_line(task);
+                writeln!(out, "{}", format_task_line(task))?;
             }
         }
         Command::First => match db::first_task(conn)? {
             Some(task) => {
-                print_task_line(&task);
+                writeln!(out, "{}", format_task_line(&task))?;
                 if !task.detail.is_empty() {
-                    println!("{}", task.detail);
+                    writeln!(out, "{}", task.detail)?;
                 }
             }
             None => {}
         },
         Command::Next => match db::next_task(conn)? {
             Some(task) => {
-                print_task_line(&task);
+                writeln!(out, "{}", format_task_line(&task))?;
                 if !task.detail.is_empty() {
-                    println!("{}", task.detail);
+                    writeln!(out, "{}", task.detail)?;
                 }
             }
             None => {}
         },
         Command::Done { id } => {
             db::toggle_task(conn, id)?;
-            println!("Marked task #{} as done", id);
+            writeln!(out, "Marked task #{} as done", id)?;
         }
         Command::Undo { id } => {
             db::toggle_task(conn, id)?;
-            println!("Marked task #{} as not done", id);
+            writeln!(out, "Marked task #{} as not done", id)?;
         }
         Command::Delete { id } => {
             db::delete_task(conn, id)?;
-            println!("Deleted task #{}", id);
+            writeln!(out, "Deleted task #{}", id)?;
         }
         Command::Clear => {
             let count = db::clear_tasks(conn)?;
-            println!("Cleared {} task(s)", count);
+            writeln!(out, "Cleared {} task(s)", count)?;
         }
         Command::Edit { id } => {
             let task = db::get_task(conn, id)?;
             let new_detail = crate::editor::edit(&task.detail)?;
             db::update_detail(conn, id, &new_detail)?;
-            println!("Updated detail for task #{}", id);
+            writeln!(out, "Updated detail for task #{}", id)?;
         }
     }
 
     Ok(())
-}
-
-fn print_task_line(task: &crate::models::Task) {
-    println!("{}", format_task_line(task));
 }
 
 fn format_task_line(task: &crate::models::Task) -> String {
@@ -145,7 +152,30 @@ fn format_task_line(task: &crate::models::Task) -> String {
 mod tests {
     use crate::models::Task;
 
-    use super::format_task_line;
+    use super::{Command, format_task_line};
+    use crate::db;
+    use clap::Parser;
+    use rusqlite::Connection;
+    use std::io::Write;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE task (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                detail TEXT NOT NULL DEFAULT '',
+                priority INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                deleted_at INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        conn
+    }
 
     #[test]
     fn test_format_task_line_with_icon() {
@@ -166,4 +196,102 @@ mod tests {
 
         assert_eq!(line, "✅ P2 write docs");
     }
+
+    #[test]
+    fn test_list_default_hides_completed() {
+        let conn = test_conn();
+        let done = db::add_task(&conn, "done task", 0).unwrap();
+        db::toggle_task(&conn, done.id).unwrap();
+        let open = db::add_task(&conn, "open task", 0).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        super::dispatch_to(&conn, Command::List { show: crate::models::ShowFilter::Incomplete }, &mut buf).unwrap();
+
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("open task"), "open task should appear: {out}");
+        assert!(!out.contains("done task"), "done task should be hidden: {out}");
+        assert_eq!(open.id > 0, true);
+    }
+
+    #[test]
+    fn test_list_completed_hides_incomplete() {
+        let conn = test_conn();
+        let done = db::add_task(&conn, "done task", 0).unwrap();
+        db::toggle_task(&conn, done.id).unwrap();
+        db::add_task(&conn, "open task", 0).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        super::dispatch_to(&conn, Command::List { show: crate::models::ShowFilter::Completed }, &mut buf).unwrap();
+
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("done task"), "done task should appear: {out}");
+        assert!(!out.contains("open task"), "open task should be hidden: {out}");
+    }
+
+    #[test]
+    fn test_list_all_shows_both() {
+        let conn = test_conn();
+        let done = db::add_task(&conn, "done task", 0).unwrap();
+        db::toggle_task(&conn, done.id).unwrap();
+        db::add_task(&conn, "open task", 0).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        super::dispatch_to(&conn, Command::List { show: crate::models::ShowFilter::All }, &mut buf).unwrap();
+
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("done task"), "done task should appear: {out}");
+        assert!(out.contains("open task"), "open task should appear: {out}");
+    }
+
+    #[test]
+    fn test_list_empty_view_produces_no_output() {
+        let conn = test_conn();
+        // only done tasks; default filter hides them
+        let done = db::add_task(&conn, "done task", 0).unwrap();
+        db::toggle_task(&conn, done.id).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        super::dispatch_to(&conn, Command::List { show: crate::models::ShowFilter::Incomplete }, &mut buf).unwrap();
+
+        assert!(buf.is_empty(), "expected no output, got: {:?}", String::from_utf8_lossy(&buf));
+        // suppress unused warning
+        let _ = done.id;
+    }
+
+    #[test]
+    fn test_clap_list_default_is_incomplete() {
+        let cli = super::Cli::try_parse_from(["trough", "list"]).unwrap();
+        match cli.command {
+            Command::List { show } => assert_eq!(show, crate::models::ShowFilter::Incomplete),
+            _ => panic!("expected List command"),
+        }
+    }
+
+    #[test]
+    fn test_clap_list_long_flag() {
+        let cli = super::Cli::try_parse_from(["trough", "list", "--show", "completed"]).unwrap();
+        match cli.command {
+            Command::List { show } => assert_eq!(show, crate::models::ShowFilter::Completed),
+            _ => panic!("expected List command"),
+        }
+    }
+
+    #[test]
+    fn test_clap_list_short_flag() {
+        let cli = super::Cli::try_parse_from(["trough", "list", "-s", "all"]).unwrap();
+        match cli.command {
+            Command::List { show } => assert_eq!(show, crate::models::ShowFilter::All),
+            _ => panic!("expected List command"),
+        }
+    }
+
+    #[test]
+    fn test_clap_list_invalid_value_rejected() {
+        let result = super::Cli::try_parse_from(["trough", "list", "--show", "bogus"]);
+        assert!(result.is_err());
+    }
+
+    // silence unused Write import if all tests compile
+    #[allow(dead_code)]
+    fn _assert_write<T: Write>(_: T) {}
 }

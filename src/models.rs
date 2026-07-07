@@ -1,5 +1,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use clap::ValueEnum;
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowFilter {
+    Incomplete,
+    Completed,
+    All,
+}
+
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: i64,

@@ -15,7 +15,7 @@ use rusqlite::Connection;
 use std::io::{self, Stdout};
 
 use crate::db;
-use crate::models::Task;
+use crate::models::{ShowFilter, Task};
 
 pub fn run(conn: &Connection) -> Result<()> {
     // Register a panic hook that restores the terminal before unwinding
@@ -41,7 +41,7 @@ pub fn run(conn: &Connection) -> Result<()> {
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection) -> Result<()> {
-    let mut tasks = db::list_tasks(conn)?;
+    let mut tasks = db::list_tasks(conn, ShowFilter::All)?;
     let mut selected_index: usize = 0;
 
     loop {
@@ -65,7 +65,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection)
                 KeyCode::Char(' ') => {
                     if selected_index < tasks.len() {
                         db::toggle_task(conn, tasks[selected_index].id)?;
-                        tasks = db::list_tasks(conn)?;
+                        tasks = db::list_tasks(conn, ShowFilter::All)?;
                         if !tasks.is_empty() && selected_index >= tasks.len() {
                             selected_index = tasks.len() - 1;
                         }
@@ -86,7 +86,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection)
                         execute!(io::stdout(), EnterAlternateScreen)?;
                         terminal.clear()?;
                         db::update_detail(conn, task.id, &new_detail)?;
-                        tasks = db::list_tasks(conn)?;
+                        tasks = db::list_tasks(conn, ShowFilter::All)?;
                         if !tasks.is_empty() && selected_index >= tasks.len() {
                             selected_index = tasks.len() - 1;
                         }

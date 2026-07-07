@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::models::Task;
+use crate::models::{ShowFilter, Task};
 
 fn db_path() -> Result<PathBuf> {
     let config = dirs::config_dir().context("cannot determine config directory")?;
@@ -120,10 +120,25 @@ pub fn push_task(conn: &Connection, title: &str, detail: &str, priority: i64) ->
     get_task(conn, id)
 }
 
-pub fn list_tasks(conn: &Connection) -> Result<Vec<Task>> {
-    let mut stmt = conn
-        .prepare("SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE deleted_at IS NULL ORDER BY priority DESC, created_at DESC")
-        .context("failed to prepare list query")?;
+pub fn list_tasks(conn: &Connection, filter: ShowFilter) -> Result<Vec<Task>> {
+    let sql = match filter {
+        ShowFilter::Incomplete => {
+            "SELECT id, title, done, detail, priority, created_at, updated_at FROM task \
+             WHERE deleted_at IS NULL AND done = 0 \
+             ORDER BY priority DESC, created_at DESC"
+        }
+        ShowFilter::Completed => {
+            "SELECT id, title, done, detail, priority, created_at, updated_at FROM task \
+             WHERE deleted_at IS NULL AND done = 1 \
+             ORDER BY priority DESC, created_at DESC"
+        }
+        ShowFilter::All => {
+            "SELECT id, title, done, detail, priority, created_at, updated_at FROM task \
+             WHERE deleted_at IS NULL \
+             ORDER BY priority DESC, created_at DESC"
+        }
+    };
+    let mut stmt = conn.prepare(sql).context("failed to prepare list query")?;
     let rows = stmt
         .query_map([], row_to_task)
         .context("failed to query tasks")?;
@@ -312,7 +327,7 @@ mod tests {
         add_task(&conn, "first", 0).unwrap();
         add_task(&conn, "second", 0).unwrap();
         add_task(&conn, "third", 0).unwrap();
-        let tasks = list_tasks(&conn).unwrap();
+        let tasks = list_tasks(&conn, ShowFilter::All).unwrap();
         assert_eq!(tasks.len(), 3);
     }
 
@@ -385,10 +400,72 @@ mod tests {
         add_task(&conn, "oldest", 0).unwrap();
         std::thread::sleep(std::time::Duration::from_secs(1));
         add_task(&conn, "newest", 0).unwrap();
-        let tasks = list_tasks(&conn).unwrap();
+        let tasks = list_tasks(&conn, ShowFilter::All).unwrap();
         // newest first (created_at DESC)
         assert_eq!(tasks[0].title, "newest");
         assert_eq!(tasks[1].title, "oldest");
+    }
+
+    #[test]
+    fn test_list_tasks_incomplete_excludes_done() {
+        let conn = test_conn();
+        let done = add_task(&conn, "done low", 0).unwrap();
+        toggle_task(&conn, done.id).unwrap();
+        let open = add_task(&conn, "open low", 0).unwrap();
+
+        let tasks = list_tasks(&conn, ShowFilter::Incomplete).unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, open.id);
+        assert!(!tasks[0].done);
+    }
+
+    #[test]
+    fn test_list_tasks_completed_excludes_incomplete() {
+        let conn = test_conn();
+        let done = add_task(&conn, "done high", 2).unwrap();
+        toggle_task(&conn, done.id).unwrap();
+        let _open = add_task(&conn, "open high", 2).unwrap();
+
+        let tasks = list_tasks(&conn, ShowFilter::Completed).unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, done.id);
+        assert!(tasks[0].done);
+    }
+
+    #[test]
+    fn test_list_tasks_all_includes_both() {
+        let conn = test_conn();
+        let done = add_task(&conn, "done", 0).unwrap();
+        toggle_task(&conn, done.id).unwrap();
+        let open = add_task(&conn, "open", 0).unwrap();
+
+        let tasks = list_tasks(&conn, ShowFilter::All).unwrap();
+
+        assert_eq!(tasks.len(), 2);
+        let ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&done.id));
+        assert!(ids.contains(&open.id));
+    }
+
+    #[test]
+    fn test_list_tasks_incomplete_preserves_order() {
+        let conn = test_conn();
+        let high = add_task(&conn, "high", 2).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let newer_low = add_task(&conn, "newer low", 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let older_low = add_task(&conn, "older low", 0).unwrap();
+        // mark the older one as done so it should NOT appear in incomplete
+        toggle_task(&conn, older_low.id).unwrap();
+
+        let tasks = list_tasks(&conn, ShowFilter::Incomplete).unwrap();
+
+        // priority DESC then created_at DESC: high first, then newer low
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, high.id);
+        assert_eq!(tasks[1].id, newer_low.id);
     }
 
     #[test]
@@ -418,10 +495,10 @@ mod tests {
     fn test_delete_task() {
         let conn = test_conn();
         let task = add_task(&conn, "delete me", 0).unwrap();
-        assert_eq!(list_tasks(&conn).unwrap().len(), 1);
+        assert_eq!(list_tasks(&conn, ShowFilter::All).unwrap().len(), 1);
 
         delete_task(&conn, task.id).unwrap();
-        assert_eq!(list_tasks(&conn).unwrap().len(), 0);
+        assert_eq!(list_tasks(&conn, ShowFilter::All).unwrap().len(), 0);
         assert_eq!(task_row_count(&conn), 1);
         assert!(get_task(&conn, task.id).is_err());
         assert!(
@@ -452,7 +529,7 @@ mod tests {
         let cleared = clear_tasks(&conn).unwrap();
 
         assert_eq!(cleared, 2);
-        assert!(list_tasks(&conn).unwrap().is_empty());
+        assert!(list_tasks(&conn, ShowFilter::All).unwrap().is_empty());
         assert!(first_task(&conn).unwrap().is_none());
         assert_eq!(task_row_count(&conn), 2);
     }
@@ -467,7 +544,7 @@ mod tests {
         let cleared = clear_tasks(&conn).unwrap();
 
         assert_eq!(cleared, 1);
-        assert!(list_tasks(&conn).unwrap().is_empty());
+        assert!(list_tasks(&conn, ShowFilter::All).unwrap().is_empty());
         assert_eq!(task_row_count(&conn), 2);
     }
 
@@ -500,7 +577,7 @@ mod tests {
     #[test]
     fn test_empty_list() {
         let conn = test_conn();
-        let tasks = list_tasks(&conn).unwrap();
+        let tasks = list_tasks(&conn, ShowFilter::All).unwrap();
         assert!(tasks.is_empty());
     }
 }
