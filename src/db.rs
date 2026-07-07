@@ -41,7 +41,8 @@ pub fn init() -> Result<Connection> {
             detail TEXT NOT NULL DEFAULT '',
             priority INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            deleted_at INTEGER
         )",
         [],
     )
@@ -51,22 +52,33 @@ pub fn init() -> Result<Connection> {
 }
 
 pub fn migrate_schema(conn: &Connection) -> Result<()> {
-    let has_priority: bool = conn
+    let columns: Vec<String> = conn
         .prepare("PRAGMA table_info(task)")
         .context("failed to prepare pragma")?
         .query_map([], |row| row.get::<_, String>(1))
         .context("failed to query table info")?
         .filter_map(|r| r.ok())
-        .any(|name| name == "priority");
+        .collect();
 
-    if !has_priority {
+    if !columns.iter().any(|name| name == "priority") {
         conn.execute(
             "ALTER TABLE task ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
             [],
         )
         .context("failed to add priority column")?;
     }
+    if !columns.iter().any(|name| name == "deleted_at") {
+        conn.execute("ALTER TABLE task ADD COLUMN deleted_at INTEGER", [])
+            .context("failed to add deleted_at column")?;
+    }
     Ok(())
+}
+
+fn unix_now() -> Result<i64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_secs() as i64)
 }
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
@@ -110,7 +122,7 @@ pub fn push_task(conn: &Connection, title: &str, detail: &str, priority: i64) ->
 
 pub fn list_tasks(conn: &Connection) -> Result<Vec<Task>> {
     let mut stmt = conn
-        .prepare("SELECT id, title, done, detail, priority, created_at, updated_at FROM task ORDER BY priority DESC, created_at DESC")
+        .prepare("SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE deleted_at IS NULL ORDER BY priority DESC, created_at DESC")
         .context("failed to prepare list query")?;
     let rows = stmt
         .query_map([], row_to_task)
@@ -124,7 +136,7 @@ pub fn list_tasks(conn: &Connection) -> Result<Vec<Task>> {
 
 pub fn first_task(conn: &Connection) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, title, done, detail, priority, created_at, updated_at FROM task ORDER BY priority DESC, created_at DESC LIMIT 1",
+        "SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE deleted_at IS NULL ORDER BY priority DESC, created_at DESC LIMIT 1",
         [],
         row_to_task,
     )
@@ -133,13 +145,10 @@ pub fn first_task(conn: &Connection) -> Result<Option<Task>> {
 }
 
 pub fn toggle_task(conn: &Connection, id: i64) -> Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_secs() as i64;
+    let now = unix_now()?;
     let updated = conn
         .execute(
-            "UPDATE task SET done = CASE WHEN done = 0 THEN 1 ELSE 0 END, updated_at = ?1 WHERE id = ?2",
+            "UPDATE task SET done = CASE WHEN done = 0 THEN 1 ELSE 0 END, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
             rusqlite::params![now, id],
         )
         .context("failed to toggle task")?;
@@ -150,8 +159,12 @@ pub fn toggle_task(conn: &Connection, id: i64) -> Result<()> {
 }
 
 pub fn delete_task(conn: &Connection, id: i64) -> Result<()> {
+    let now = unix_now()?;
     let deleted = conn
-        .execute("DELETE FROM task WHERE id = ?1", rusqlite::params![id])
+        .execute(
+            "UPDATE task SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            rusqlite::params![now, id],
+        )
         .context("failed to delete task")?;
     if deleted == 0 {
         anyhow::bail!("task with id {} not found", id);
@@ -159,14 +172,20 @@ pub fn delete_task(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+pub fn clear_tasks(conn: &Connection) -> Result<usize> {
+    let now = unix_now()?;
+    conn.execute(
+        "UPDATE task SET deleted_at = ?1, updated_at = ?1 WHERE deleted_at IS NULL",
+        rusqlite::params![now],
+    )
+    .context("failed to clear tasks")
+}
+
 pub fn update_detail(conn: &Connection, id: i64, detail: &str) -> Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_secs() as i64;
+    let now = unix_now()?;
     let updated = conn
         .execute(
-            "UPDATE task SET detail = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE task SET detail = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
             rusqlite::params![detail, now, id],
         )
         .context("failed to update detail")?;
@@ -178,7 +197,7 @@ pub fn update_detail(conn: &Connection, id: i64, detail: &str) -> Result<()> {
 
 pub fn get_task(conn: &Connection, id: i64) -> Result<Task> {
     conn.query_row(
-        "SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE id = ?1",
+        "SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE id = ?1 AND deleted_at IS NULL",
         rusqlite::params![id],
         row_to_task,
     )
@@ -200,12 +219,55 @@ mod tests {
                 detail TEXT NOT NULL DEFAULT '',
                 priority INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                deleted_at INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn legacy_test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE task (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                detail TEXT NOT NULL DEFAULT '',
+                priority INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )",
             [],
         )
         .unwrap();
         conn
+    }
+
+    fn task_row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM task", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn has_column(conn: &Connection, column: &str) -> bool {
+        conn.prepare("PRAGMA table_info(task)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|name| name == column)
+    }
+
+    #[test]
+    fn test_migrate_schema_adds_deleted_at() {
+        let conn = legacy_test_conn();
+        assert!(!has_column(&conn, "deleted_at"));
+
+        migrate_schema(&conn).unwrap();
+
+        assert!(has_column(&conn, "deleted_at"));
     }
 
     #[test]
@@ -300,6 +362,17 @@ mod tests {
 
         delete_task(&conn, task.id).unwrap();
         assert_eq!(list_tasks(&conn).unwrap().len(), 0);
+        assert_eq!(task_row_count(&conn), 1);
+        assert!(get_task(&conn, task.id).is_err());
+        assert!(
+            conn.query_row(
+                "SELECT deleted_at FROM task WHERE id = ?1",
+                rusqlite::params![task.id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[test]
@@ -308,6 +381,34 @@ mod tests {
         let result = delete_task(&conn, 999);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_clear_tasks() {
+        let conn = test_conn();
+        add_task(&conn, "first", 0).unwrap();
+        add_task(&conn, "second", 0).unwrap();
+
+        let cleared = clear_tasks(&conn).unwrap();
+
+        assert_eq!(cleared, 2);
+        assert!(list_tasks(&conn).unwrap().is_empty());
+        assert!(first_task(&conn).unwrap().is_none());
+        assert_eq!(task_row_count(&conn), 2);
+    }
+
+    #[test]
+    fn test_clear_tasks_ignores_already_deleted_tasks() {
+        let conn = test_conn();
+        let deleted = add_task(&conn, "deleted", 0).unwrap();
+        add_task(&conn, "active", 0).unwrap();
+        delete_task(&conn, deleted.id).unwrap();
+
+        let cleared = clear_tasks(&conn).unwrap();
+
+        assert_eq!(cleared, 1);
+        assert!(list_tasks(&conn).unwrap().is_empty());
+        assert_eq!(task_row_count(&conn), 2);
     }
 
     #[test]

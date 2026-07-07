@@ -52,6 +52,8 @@ enum Command {
         /// Task ID
         id: i64,
     },
+    /// Delete all tasks
+    Clear,
     /// Edit task detail with $EDITOR
     Edit {
         /// Task ID
@@ -72,17 +74,12 @@ pub fn run(conn: &Connection) -> Result<()> {
             detail,
             priority,
         } => {
-            let task = db::push_task(conn, &title, &detail, priority)?;
-            println!("Pushed task #{}: {}", task.id, task.title);
+            db::push_task(conn, &title, &detail, priority)?;
         }
         Command::List => {
             let tasks = db::list_tasks(conn)?;
-            if tasks.is_empty() {
-                println!("No tasks yet");
-            } else {
-                for task in &tasks {
-                    print_task_line(task);
-                }
+            for task in &tasks {
+                print_task_line(task);
             }
         }
         Command::Next => match db::first_task(conn)? {
@@ -106,6 +103,10 @@ pub fn run(conn: &Connection) -> Result<()> {
             db::delete_task(conn, id)?;
             println!("Deleted task #{}", id);
         }
+        Command::Clear => {
+            let count = db::clear_tasks(conn)?;
+            println!("Cleared {} task(s)", count);
+        }
         Command::Edit { id } => {
             let task = db::get_task(conn, id)?;
             let new_detail = crate::editor::edit(&task.detail)?;
@@ -118,13 +119,41 @@ pub fn run(conn: &Connection) -> Result<()> {
 }
 
 fn print_task_line(task: &crate::models::Task) {
-    let status = if task.done { "x" } else { " " };
+    println!("{}", format_task_line(task));
+}
+
+fn format_task_line(task: &crate::models::Task) -> String {
+    let status = if task.done { "✅" } else { "❌" };
     if task.priority > 0 {
-        println!(
-            "[{}] P{} {}. {}",
-            status, task.priority, task.id, task.title
-        );
+        format!("{} P{} {}", status, task.priority, task.title)
     } else {
-        println!("[{}] {}. {}", status, task.id, task.title);
+        format!("{} {}", status, task.title)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::Task;
+
+    use super::format_task_line;
+
+    #[test]
+    fn test_format_task_line_with_icon() {
+        let task = Task::new("write docs");
+
+        let line = format_task_line(&task);
+
+        assert_eq!(line, "❌ write docs");
+    }
+
+    #[test]
+    fn test_format_task_line_with_done_icon_and_priority() {
+        let mut task = Task::new("write docs");
+        task.done = true;
+        task.priority = 2;
+
+        let line = format_task_line(&task);
+
+        assert_eq!(line, "✅ P2 write docs");
     }
 }

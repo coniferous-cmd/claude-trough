@@ -10,6 +10,11 @@ CREATE TABLE task(
  detail TEXT NOT NULL DEFAULT '',
  priority INTEGER NOT NULL DEFAULT 0,
  created_at INTEGER NOT NULL,
- updated_at INTEGER NOT NULL
+ updated_at INTEGER NOT NULL,
+ deleted_at INTEGER
 );
 ```
+
+`deleted_at` is `NULL` for active tasks. Task deletion is logical: `delete`
+sets `deleted_at` for one task, and `clear` sets `deleted_at` for all active
+tasks. Rows are not physically removed.
