@@ -35,7 +35,8 @@ enum Command {
     /// List all tasks
     List,
     /// Show the first task by list order
-    #[command(alias = "first")]
+    First,
+    /// Show and complete the next incomplete task by list order
     Next,
     /// Mark a task as done
     Done {
@@ -82,14 +83,23 @@ pub fn run(conn: &Connection) -> Result<()> {
                 print_task_line(task);
             }
         }
-        Command::Next => match db::first_task(conn)? {
+        Command::First => match db::first_task(conn)? {
             Some(task) => {
                 print_task_line(&task);
                 if !task.detail.is_empty() {
                     println!("{}", task.detail);
                 }
             }
-            None => println!("No tasks yet"),
+            None => {}
+        },
+        Command::Next => match db::next_task(conn)? {
+            Some(task) => {
+                print_task_line(&task);
+                if !task.detail.is_empty() {
+                    println!("{}", task.detail);
+                }
+            }
+            None => {}
         },
         Command::Done { id } => {
             db::toggle_task(conn, id)?;

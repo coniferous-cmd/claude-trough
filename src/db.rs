@@ -144,6 +144,29 @@ pub fn first_task(conn: &Connection) -> Result<Option<Task>> {
     .context("failed to query first task")
 }
 
+pub fn next_task(conn: &Connection) -> Result<Option<Task>> {
+    let Some(task) = conn
+        .query_row(
+            "SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE deleted_at IS NULL AND done = 0 ORDER BY priority DESC, created_at DESC LIMIT 1",
+            [],
+            row_to_task,
+        )
+        .optional()
+        .context("failed to query next task")?
+    else {
+        return Ok(None);
+    };
+
+    let now = unix_now()?;
+    conn.execute(
+        "UPDATE task SET done = 1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+        rusqlite::params![now, task.id],
+    )
+    .context("failed to mark next task as done")?;
+
+    get_task(conn, task.id).map(Some)
+}
+
 pub fn toggle_task(conn: &Connection, id: i64) -> Result<()> {
     let now = unix_now()?;
     let updated = conn
@@ -317,6 +340,43 @@ mod tests {
         let conn = test_conn();
         let task = first_task(&conn).unwrap();
         assert!(task.is_none());
+    }
+
+    #[test]
+    fn test_next_task_marks_first_incomplete_done() {
+        let conn = test_conn();
+        add_task(&conn, "low priority", 0).unwrap();
+        let high = add_task(&conn, "high priority", 2).unwrap();
+
+        let task = next_task(&conn).unwrap().unwrap();
+
+        assert_eq!(task.id, high.id);
+        assert!(task.done);
+        assert!(get_task(&conn, high.id).unwrap().done);
+    }
+
+    #[test]
+    fn test_next_task_skips_completed_tasks() {
+        let conn = test_conn();
+        let completed = add_task(&conn, "completed high priority", 3).unwrap();
+        toggle_task(&conn, completed.id).unwrap();
+        let incomplete = add_task(&conn, "incomplete low priority", 0).unwrap();
+
+        let task = next_task(&conn).unwrap().unwrap();
+
+        assert_eq!(task.id, incomplete.id);
+        assert!(task.done);
+    }
+
+    #[test]
+    fn test_next_task_empty_when_no_incomplete_tasks() {
+        let conn = test_conn();
+        let task = add_task(&conn, "done", 0).unwrap();
+        toggle_task(&conn, task.id).unwrap();
+
+        let next = next_task(&conn).unwrap();
+
+        assert!(next.is_none());
     }
 
     #[test]
