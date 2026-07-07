@@ -55,6 +55,38 @@ Notes:
 - Priority is documented as `0-3`, but the current code does not enforce the range.
 - `done` and `undo` currently both toggle completion state.
 
+## npm package
+
+The npm package exposes the same `trough` command through a Node.js wrapper.
+The wrapper selects a prebuilt Rust binary for the current platform from:
+
+```text
+dist/<platform>/trough
+dist/<platform>/trough.exe
+```
+
+Supported package platforms:
+
+- `darwin-x64`
+- `darwin-arm64`
+- `linux-x64`
+- `linux-arm64`
+- `win32-x64`
+- `win32-arm64`
+
+The npm package must include:
+
+- `bin/trough.js`
+- `dist/`
+- `docs/`
+- `Cargo.toml`
+- `Cargo.lock`
+
+The publish workflow builds each supported platform, verifies all expected
+release binaries exist, runs `npm pack --dry-run`, then publishes with npm
+provenance. `package.json` and `Cargo.toml` versions must match before an
+automatic version tag can be created.
+
 ## SQL
 
 The main table is `task`.

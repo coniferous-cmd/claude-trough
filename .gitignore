@@ -2,3 +2,6 @@
 .DS_Store
 .claude
 .obsidian/
+AGENTS.md
+dist/
+*.tgz

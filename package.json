@@ -1,0 +1,24 @@
+{
+  "name": "trough",
+  "version": "0.1.0",
+  "description": "A Rust CLI and TUI task queue.",
+  "bin": {
+    "trough": "bin/trough.js"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "docs/",
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
+  "scripts": {
+    "build": "cargo build --release",
+    "prepack": "node scripts/prepare-npm-binary.js",
+    "check:npm-dist": "node scripts/check-npm-dist.js",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
