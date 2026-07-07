@@ -1,11 +1,11 @@
-# todo-cli
+# trough
 
 A fast, lightweight, keyboard-first terminal todo application.
 
 ## Goals
 
-- Program name: `todo-cli`
-- Database path: `~/.todo/todo.db`
+- Program name: `trough`
+- Database path: `~/.config/trough/trough.db`
 - Single binary
 - Cross platform
 - SQLite

@@ -1,6 +1,6 @@
 # Database
 
-Path: `~/.todo/todo.db`
+Path: `~/.config/trough/trough.db`
 
 ```sql
 CREATE TABLE task(
