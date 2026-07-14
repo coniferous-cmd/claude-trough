@@ -12,6 +12,8 @@ pub enum ShowFilter {
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: i64,
+    #[allow(dead_code)]
+    pub project_id: Option<i64>,
     pub title: String,
     pub done: bool,
     pub detail: String,
@@ -30,6 +32,7 @@ impl Task {
             .unwrap_or(0);
         Self {
             id: 0,
+            project_id: None,
             title: title.to_string(),
             done: false,
             detail: String::new(),

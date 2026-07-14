@@ -27,5 +27,7 @@ select the completion view; `-s` is the short form of `--show`. `list` prints no
 output when there are no tasks in the selected view. CLI task output uses `✅`
 for completed tasks and `❌` for incomplete tasks. `first` shows the first task
 without changing it. `first` prints no output when there are no active tasks.
-`next` shows the first incomplete task and marks it done, and prints no output
-when there are no incomplete tasks.
+`next` shows and completes the first incomplete task associated with the
+canonical current-directory project. It prints no output when that project is
+unknown or has no incomplete tasks, and it does not fall back to another
+project or an unscoped task.

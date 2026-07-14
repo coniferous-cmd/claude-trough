@@ -33,6 +33,8 @@ pub fn init() -> Result<Connection> {
     }
 
     let conn = Connection::open(&path).context("failed to open database")?;
+    conn.execute("PRAGMA foreign_keys = ON", [])
+        .context("failed to enable foreign keys")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS task (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,6 +49,16 @@ pub fn init() -> Result<Connection> {
         [],
     )
     .context("failed to create task table")?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS project (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
+    )
+    .context("failed to create project table")?;
     migrate_schema(&conn)?;
     Ok(conn)
 }
@@ -71,6 +83,18 @@ pub fn migrate_schema(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE task ADD COLUMN deleted_at INTEGER", [])
             .context("failed to add deleted_at column")?;
     }
+    if !columns.iter().any(|name| name == "project_id") {
+        conn.execute(
+            "ALTER TABLE task ADD COLUMN project_id INTEGER REFERENCES project(id)",
+            [],
+        )
+        .context("failed to add project_id column")?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS task_project_id_idx ON task(project_id)",
+        [],
+    )
+    .context("failed to create project_id index")?;
     Ok(())
 }
 
@@ -84,6 +108,7 @@ fn unix_now() -> Result<i64> {
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
     Ok(Task {
         id: row.get("id")?,
+        project_id: row.get("project_id")?,
         title: row.get("title")?,
         done: row.get::<_, i32>("done")? != 0,
         detail: row.get("detail")?,
@@ -105,17 +130,61 @@ pub fn add_task(conn: &Connection, title: &str, priority: i64) -> Result<Task> {
     get_task(conn, id)
 }
 
-pub fn push_task(conn: &Connection, title: &str, detail: &str, priority: i64) -> Result<Task> {
+pub fn push_task(
+    conn: &Connection,
+    title: &str,
+    detail: &str,
+    priority: i64,
+    project_path: Option<&std::path::Path>,
+) -> Result<Task> {
     let mut task = Task::new(title);
     task.detail = detail.to_string();
     task.priority = priority;
     task.created_at = 0; // push to bottom via old timestamp
     task.updated_at = 0;
-    conn.execute(
-        "INSERT INTO task (title, detail, priority, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![task.title, task.detail, task.priority, task.created_at, task.updated_at],
+
+    let tx = conn.unchecked_transaction()?;
+
+    let project_id: Option<i64> = match project_path {
+        Some(path) => {
+            let path_str = path
+                .to_str()
+                .context("project path contains invalid UTF-8")?;
+            let now = unix_now()?;
+            tx.execute(
+                "INSERT INTO project (path, created_at, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(path) DO UPDATE SET updated_at = ?3",
+                rusqlite::params![path_str, now, now],
+            )
+            .context("failed to upsert project")?;
+            let id: i64 = tx
+                .query_row(
+                    "SELECT id FROM project WHERE path = ?1",
+                    rusqlite::params![path_str],
+                    |row| row.get(0),
+                )
+                .context("failed to retrieve project id")?;
+            Some(id)
+        }
+        None => None,
+    };
+
+    tx.execute(
+        "INSERT INTO task (project_id, title, detail, priority, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            project_id,
+            task.title,
+            task.detail,
+            task.priority,
+            task.created_at,
+            task.updated_at
+        ],
     )
     .context("failed to insert task")?;
+
+    tx.commit()?;
+
     let id = conn.last_insert_rowid();
     get_task(conn, id)
 }
@@ -123,17 +192,17 @@ pub fn push_task(conn: &Connection, title: &str, detail: &str, priority: i64) ->
 pub fn list_tasks(conn: &Connection, filter: ShowFilter) -> Result<Vec<Task>> {
     let sql = match filter {
         ShowFilter::Incomplete => {
-            "SELECT id, title, done, detail, priority, created_at, updated_at FROM task \
+            "SELECT id, project_id, title, done, detail, priority, created_at, updated_at FROM task \
              WHERE deleted_at IS NULL AND done = 0 \
              ORDER BY priority DESC, created_at DESC"
         }
         ShowFilter::Completed => {
-            "SELECT id, title, done, detail, priority, created_at, updated_at FROM task \
+            "SELECT id, project_id, title, done, detail, priority, created_at, updated_at FROM task \
              WHERE deleted_at IS NULL AND done = 1 \
              ORDER BY priority DESC, created_at DESC"
         }
         ShowFilter::All => {
-            "SELECT id, title, done, detail, priority, created_at, updated_at FROM task \
+            "SELECT id, project_id, title, done, detail, priority, created_at, updated_at FROM task \
              WHERE deleted_at IS NULL \
              ORDER BY priority DESC, created_at DESC"
         }
@@ -151,7 +220,7 @@ pub fn list_tasks(conn: &Connection, filter: ShowFilter) -> Result<Vec<Task>> {
 
 pub fn first_task(conn: &Connection) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE deleted_at IS NULL ORDER BY priority DESC, created_at DESC LIMIT 1",
+        "SELECT id, project_id, title, done, detail, priority, created_at, updated_at FROM task WHERE deleted_at IS NULL ORDER BY priority DESC, created_at DESC LIMIT 1",
         [],
         row_to_task,
     )
@@ -159,11 +228,20 @@ pub fn first_task(conn: &Connection) -> Result<Option<Task>> {
     .context("failed to query first task")
 }
 
-pub fn next_task(conn: &Connection) -> Result<Option<Task>> {
+pub fn next_task(conn: &Connection, project_path: &std::path::Path) -> Result<Option<Task>> {
+    let project_path = project_path
+        .to_str()
+        .context("project path contains invalid UTF-8")?;
     let Some(task) = conn
         .query_row(
-            "SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE deleted_at IS NULL AND done = 0 ORDER BY priority DESC, created_at DESC LIMIT 1",
-            [],
+            "SELECT task.id, task.project_id, task.title, task.done, task.detail, \
+                    task.priority, task.created_at, task.updated_at \
+             FROM task \
+             JOIN project ON project.id = task.project_id \
+             WHERE project.path = ?1 AND task.deleted_at IS NULL AND task.done = 0 \
+             ORDER BY task.priority DESC, task.created_at DESC \
+             LIMIT 1",
+            rusqlite::params![project_path],
             row_to_task,
         )
         .optional()
@@ -235,7 +313,7 @@ pub fn update_detail(conn: &Connection, id: i64, detail: &str) -> Result<()> {
 
 pub fn get_task(conn: &Connection, id: i64) -> Result<Task> {
     conn.query_row(
-        "SELECT id, title, done, detail, priority, created_at, updated_at FROM task WHERE id = ?1 AND deleted_at IS NULL",
+        "SELECT id, project_id, title, done, detail, priority, created_at, updated_at FROM task WHERE id = ?1 AND deleted_at IS NULL",
         rusqlite::params![id],
         row_to_task,
     )
@@ -249,9 +327,16 @@ mod tests {
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE task (
+        conn.execute_batch(
+            "CREATE TABLE project (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE task (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER REFERENCES project(id),
                 title TEXT NOT NULL,
                 done INTEGER NOT NULL DEFAULT 0,
                 detail TEXT NOT NULL DEFAULT '',
@@ -259,8 +344,7 @@ mod tests {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 deleted_at INTEGER
-            )",
-            [],
+            );",
         )
         .unwrap();
         conn
@@ -334,7 +418,7 @@ mod tests {
     #[test]
     fn test_push_task_with_detail() {
         let conn = test_conn();
-        let task = push_task(&conn, "write docs", "include usage examples", 0).unwrap();
+        let task = push_task(&conn, "write docs", "include usage examples", 0, None).unwrap();
 
         assert_eq!(task.title, "write docs");
         assert_eq!(task.detail, "include usage examples");
@@ -360,10 +444,11 @@ mod tests {
     #[test]
     fn test_next_task_marks_first_incomplete_done() {
         let conn = test_conn();
-        add_task(&conn, "low priority", 0).unwrap();
-        let high = add_task(&conn, "high priority", 2).unwrap();
+        let path = std::path::Path::new("/tmp/next-current-project");
+        push_task(&conn, "low priority", "", 0, Some(path)).unwrap();
+        let high = push_task(&conn, "high priority", "", 2, Some(path)).unwrap();
 
-        let task = next_task(&conn).unwrap().unwrap();
+        let task = next_task(&conn, path).unwrap().unwrap();
 
         assert_eq!(task.id, high.id);
         assert!(task.done);
@@ -373,11 +458,12 @@ mod tests {
     #[test]
     fn test_next_task_skips_completed_tasks() {
         let conn = test_conn();
-        let completed = add_task(&conn, "completed high priority", 3).unwrap();
+        let path = std::path::Path::new("/tmp/next-skip-completed");
+        let completed = push_task(&conn, "completed high priority", "", 3, Some(path)).unwrap();
         toggle_task(&conn, completed.id).unwrap();
-        let incomplete = add_task(&conn, "incomplete low priority", 0).unwrap();
+        let incomplete = push_task(&conn, "incomplete low priority", "", 0, Some(path)).unwrap();
 
-        let task = next_task(&conn).unwrap().unwrap();
+        let task = next_task(&conn, path).unwrap().unwrap();
 
         assert_eq!(task.id, incomplete.id);
         assert!(task.done);
@@ -386,12 +472,65 @@ mod tests {
     #[test]
     fn test_next_task_empty_when_no_incomplete_tasks() {
         let conn = test_conn();
-        let task = add_task(&conn, "done", 0).unwrap();
+        let path = std::path::Path::new("/tmp/next-empty-project");
+        let task = push_task(&conn, "done", "", 0, Some(path)).unwrap();
         toggle_task(&conn, task.id).unwrap();
 
-        let next = next_task(&conn).unwrap();
+        let next = next_task(&conn, path).unwrap();
 
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn test_next_task_is_strictly_scoped_to_project() {
+        let conn = test_conn();
+        let current_path = std::path::Path::new("/tmp/next-project-a");
+        let other_path = std::path::Path::new("/tmp/next-project-b");
+        let current = push_task(&conn, "current project", "", 0, Some(current_path)).unwrap();
+        let other = push_task(&conn, "other project", "", 3, Some(other_path)).unwrap();
+        let unscoped = add_task(&conn, "unscoped", 3).unwrap();
+
+        let task = next_task(&conn, current_path).unwrap().unwrap();
+
+        assert_eq!(task.id, current.id);
+        assert!(task.done);
+        assert!(!get_task(&conn, other.id).unwrap().done);
+        assert!(!get_task(&conn, unscoped.id).unwrap().done);
+    }
+
+    #[test]
+    fn test_next_task_unknown_project_does_not_create_project_or_fallback() {
+        let conn = test_conn();
+        let other_path = std::path::Path::new("/tmp/next-existing-project");
+        let other = push_task(&conn, "other project", "", 0, Some(other_path)).unwrap();
+        let unscoped = add_task(&conn, "unscoped", 0).unwrap();
+        let project_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
+            .unwrap();
+
+        let task = next_task(&conn, std::path::Path::new("/tmp/next-unknown-project")).unwrap();
+
+        assert!(task.is_none());
+        assert!(!get_task(&conn, other.id).unwrap().done);
+        assert!(!get_task(&conn, unscoped.id).unwrap().done);
+        let project_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(project_count_after, project_count_before);
+    }
+
+    #[test]
+    fn test_next_task_skips_deleted_task_in_current_project() {
+        let conn = test_conn();
+        let path = std::path::Path::new("/tmp/next-skip-deleted");
+        let deleted = push_task(&conn, "deleted high", "", 3, Some(path)).unwrap();
+        delete_task(&conn, deleted.id).unwrap();
+        let active = push_task(&conn, "active low", "", 0, Some(path)).unwrap();
+
+        let task = next_task(&conn, path).unwrap().unwrap();
+
+        assert_eq!(task.id, active.id);
+        assert!(task.done);
     }
 
     #[test]
@@ -575,9 +714,253 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_list() {
-        let conn = test_conn();
+    fn test_migrate_schema_adds_project_table_and_column() {
+        let conn = legacy_test_conn();
+        assert!(!has_column(&conn, "project_id"));
+
+        migrate_schema(&conn).unwrap();
+
+        // Verify project_id column added
+        assert!(has_column(&conn, "project_id"));
+
+        // Verify index exists
+        let has_index: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='task_project_id_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_index, "task_project_id_idx should exist");
+    }
+
+    #[test]
+    fn test_migrate_schema_on_current_schema_adds_project_id() {
+        // Simulate current production schema (has deleted_at, no project_id)
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE task (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                detail TEXT NOT NULL DEFAULT '',
+                priority INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                deleted_at INTEGER
+            );",
+        )
+        .unwrap();
+        assert!(!has_column(&conn, "project_id"));
+        assert!(has_column(&conn, "deleted_at"));
+
+        migrate_schema(&conn).unwrap();
+
+        assert!(has_column(&conn, "project_id"));
+
+        // Add project table so normal API works (normally created by init())
+        conn.execute_batch(
+            "CREATE TABLE project (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        // After migration, normal API works
+        let task = add_task(&conn, "post-migration", 0).unwrap();
+        assert!(task.project_id.is_none());
+        assert_eq!(task.title, "post-migration");
+    }
+
+    #[test]
+    fn test_migrate_schema_is_idempotent() {
+        let conn = legacy_test_conn();
+        // Insert directly since add_task/get_task need project_id column
+        conn.execute(
+            "INSERT INTO task (title, done, detail, priority, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["survivor", 0, "", 3, 100, 100],
+        )
+        .unwrap();
+
+        migrate_schema(&conn).unwrap();
+        migrate_schema(&conn).unwrap();
+
+        let task = get_task(&conn, 1).unwrap();
+        assert_eq!(task.title, "survivor");
+        assert_eq!(task.priority, 3);
+        assert!(task.project_id.is_none());
+    }
+
+    #[test]
+    fn test_migrate_schema_preserves_old_data() {
+        let conn = legacy_test_conn();
+        // Insert directly, then verify after migration
+        conn.execute(
+            "INSERT INTO task (title, done, detail, priority, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["legacy", 0, "", 5, 200, 200],
+        )
+        .unwrap();
+
+        migrate_schema(&conn).unwrap();
+
+        let fetched = get_task(&conn, 1).unwrap();
+        assert_eq!(fetched.title, "legacy");
+        assert_eq!(fetched.priority, 5);
+        assert!(fetched.project_id.is_none());
+    }
+
+    fn test_conn_with_project() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+            CREATE TABLE project (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE task (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER REFERENCES project(id),
+                title TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                detail TEXT NOT NULL DEFAULT '',
+                priority INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                deleted_at INTEGER
+            );
+            CREATE INDEX task_project_id_idx ON task(project_id);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_foreign_key_enforced_on_project_id() {
+        let conn = test_conn_with_project();
+        let result = conn.execute(
+            "INSERT INTO task (project_id, title, created_at, updated_at) VALUES (999, 'orphan', 0, 0)",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "foreign key should reject invalid project_id"
+        );
+    }
+
+    #[test]
+    fn test_push_creates_project_on_new_path() {
+        let conn = test_conn_with_project();
+        let path = std::path::Path::new("/tmp/test-project-a");
+
+        let task = push_task(&conn, "task from A", "", 0, Some(path)).unwrap();
+
+        assert_eq!(task.project_id, Some(1));
+        assert_eq!(task.title, "task from A");
+
+        let project_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(project_count, 1);
+    }
+
+    #[test]
+    fn test_push_reuses_project_on_same_path() {
+        let conn = test_conn_with_project();
+        let path = std::path::Path::new("/tmp/test-project-b");
+
+        push_task(&conn, "first from B", "", 0, Some(path)).unwrap();
+        push_task(&conn, "second from B", "", 0, Some(path)).unwrap();
+
+        let project_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            project_count, 1,
+            "should reuse project, not create duplicate"
+        );
+
         let tasks = list_tasks(&conn, ShowFilter::All).unwrap();
-        assert!(tasks.is_empty());
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].project_id, Some(1));
+        assert_eq!(tasks[1].project_id, Some(1));
+    }
+
+    #[test]
+    fn test_push_creates_separate_projects_for_different_paths() {
+        let conn = test_conn_with_project();
+        let path_a = std::path::Path::new("/tmp/project-a");
+        let path_b = std::path::Path::new("/tmp/project-b");
+
+        push_task(&conn, "from A", "", 0, Some(path_a)).unwrap();
+        push_task(&conn, "from B", "", 0, Some(path_b)).unwrap();
+
+        let project_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(project_count, 2);
+    }
+
+    #[test]
+    fn test_push_without_path_has_no_project() {
+        let conn = test_conn();
+
+        let task = push_task(&conn, "no project task", "details", 0, None).unwrap();
+
+        assert!(task.project_id.is_none());
+        assert_eq!(task.detail, "details");
+    }
+
+    #[test]
+    fn test_push_preserves_detail_and_priority() {
+        let conn = test_conn_with_project();
+        let path = std::path::Path::new("/tmp/test-proj");
+
+        let task = push_task(&conn, "important", "critical detail", 3, Some(path)).unwrap();
+
+        assert_eq!(task.detail, "critical detail");
+        assert_eq!(task.priority, 3);
+    }
+
+    #[test]
+    fn test_push_task_at_bottom() {
+        let conn = test_conn_with_project();
+        let path = std::path::Path::new("/tmp/bottom-test");
+
+        add_task(&conn, "normal task", 0).unwrap();
+        push_task(&conn, "pushed task", "", 0, Some(path)).unwrap();
+
+        let tasks = list_tasks(&conn, ShowFilter::All).unwrap();
+        assert_eq!(tasks.len(), 2);
+        // pushed task should be at the end (oldest created_at)
+        assert_eq!(tasks[0].title, "normal task");
+        assert_eq!(tasks[1].title, "pushed task");
+    }
+
+    #[test]
+    fn test_add_task_creates_no_project() {
+        let conn = test_conn_with_project();
+
+        let task = add_task(&conn, "add task", 0).unwrap();
+
+        assert!(task.project_id.is_none());
+    }
+
+    #[test]
+    fn test_list_tasks_all_includes_tasks_with_and_without_project() {
+        let conn = test_conn_with_project();
+        let path = std::path::Path::new("/tmp/mixed");
+
+        add_task(&conn, "unscoped", 0).unwrap();
+        push_task(&conn, "scoped", "", 0, Some(path)).unwrap();
+
+        let tasks = list_tasks(&conn, ShowFilter::All).unwrap();
+        assert_eq!(tasks.len(), 2);
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 use std::io::{self, Write};
@@ -86,7 +86,10 @@ fn dispatch_to<W: Write>(conn: &Connection, command: Command, out: &mut W) -> Re
             detail,
             priority,
         } => {
-            db::push_task(conn, &title, &detail, priority)?;
+            let cwd = std::env::current_dir().context("failed to determine current directory")?;
+            let canonical =
+                std::fs::canonicalize(&cwd).context("failed to canonicalize current directory")?;
+            db::push_task(conn, &title, &detail, priority, Some(&canonical))?;
         }
         Command::List { show } => {
             let tasks = db::list_tasks(conn, show)?;
@@ -94,24 +97,25 @@ fn dispatch_to<W: Write>(conn: &Connection, command: Command, out: &mut W) -> Re
                 writeln!(out, "{}", format_task_line(task))?;
             }
         }
-        Command::First => match db::first_task(conn)? {
-            Some(task) => {
+        Command::First => {
+            if let Some(task) = db::first_task(conn)? {
                 writeln!(out, "{}", format_task_line(&task))?;
                 if !task.detail.is_empty() {
                     writeln!(out, "{}", task.detail)?;
                 }
             }
-            None => {}
-        },
-        Command::Next => match db::next_task(conn)? {
-            Some(task) => {
+        }
+        Command::Next => {
+            let cwd = std::env::current_dir().context("failed to determine current directory")?;
+            let canonical =
+                std::fs::canonicalize(&cwd).context("failed to canonicalize current directory")?;
+            if let Some(task) = db::next_task(conn, &canonical)? {
                 writeln!(out, "{}", format_task_line(&task))?;
                 if !task.detail.is_empty() {
                     writeln!(out, "{}", task.detail)?;
                 }
             }
-            None => {}
-        },
+        }
         Command::Done { id } => {
             db::toggle_task(conn, id)?;
             writeln!(out, "Marked task #{} as done", id)?;
@@ -160,9 +164,16 @@ mod tests {
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE task (
+        conn.execute_batch(
+            "CREATE TABLE project (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE task (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER REFERENCES project(id),
                 title TEXT NOT NULL,
                 done INTEGER NOT NULL DEFAULT 0,
                 detail TEXT NOT NULL DEFAULT '',
@@ -170,8 +181,7 @@ mod tests {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 deleted_at INTEGER
-            )",
-            [],
+            );",
         )
         .unwrap();
         conn
@@ -205,12 +215,22 @@ mod tests {
         let open = db::add_task(&conn, "open task", 0).unwrap();
 
         let mut buf: Vec<u8> = Vec::new();
-        super::dispatch_to(&conn, Command::List { show: crate::models::ShowFilter::Incomplete }, &mut buf).unwrap();
+        super::dispatch_to(
+            &conn,
+            Command::List {
+                show: crate::models::ShowFilter::Incomplete,
+            },
+            &mut buf,
+        )
+        .unwrap();
 
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("open task"), "open task should appear: {out}");
-        assert!(!out.contains("done task"), "done task should be hidden: {out}");
-        assert_eq!(open.id > 0, true);
+        assert!(
+            !out.contains("done task"),
+            "done task should be hidden: {out}"
+        );
+        assert!(open.id > 0);
     }
 
     #[test]
@@ -221,11 +241,21 @@ mod tests {
         db::add_task(&conn, "open task", 0).unwrap();
 
         let mut buf: Vec<u8> = Vec::new();
-        super::dispatch_to(&conn, Command::List { show: crate::models::ShowFilter::Completed }, &mut buf).unwrap();
+        super::dispatch_to(
+            &conn,
+            Command::List {
+                show: crate::models::ShowFilter::Completed,
+            },
+            &mut buf,
+        )
+        .unwrap();
 
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("done task"), "done task should appear: {out}");
-        assert!(!out.contains("open task"), "open task should be hidden: {out}");
+        assert!(
+            !out.contains("open task"),
+            "open task should be hidden: {out}"
+        );
     }
 
     #[test]
@@ -236,7 +266,14 @@ mod tests {
         db::add_task(&conn, "open task", 0).unwrap();
 
         let mut buf: Vec<u8> = Vec::new();
-        super::dispatch_to(&conn, Command::List { show: crate::models::ShowFilter::All }, &mut buf).unwrap();
+        super::dispatch_to(
+            &conn,
+            Command::List {
+                show: crate::models::ShowFilter::All,
+            },
+            &mut buf,
+        )
+        .unwrap();
 
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("done task"), "done task should appear: {out}");
@@ -251,11 +288,49 @@ mod tests {
         db::toggle_task(&conn, done.id).unwrap();
 
         let mut buf: Vec<u8> = Vec::new();
-        super::dispatch_to(&conn, Command::List { show: crate::models::ShowFilter::Incomplete }, &mut buf).unwrap();
+        super::dispatch_to(
+            &conn,
+            Command::List {
+                show: crate::models::ShowFilter::Incomplete,
+            },
+            &mut buf,
+        )
+        .unwrap();
 
-        assert!(buf.is_empty(), "expected no output, got: {:?}", String::from_utf8_lossy(&buf));
+        assert!(
+            buf.is_empty(),
+            "expected no output, got: {:?}",
+            String::from_utf8_lossy(&buf)
+        );
         // suppress unused warning
         let _ = done.id;
+    }
+
+    #[test]
+    fn test_next_uses_canonical_current_project_path() {
+        let conn = test_conn();
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let current = db::push_task(&conn, "current project", "", 0, Some(&cwd)).unwrap();
+        let other = db::push_task(
+            &conn,
+            "other project",
+            "",
+            3,
+            Some(std::path::Path::new("/tmp/cli-next-other-project")),
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+
+        super::dispatch_to(&conn, Command::Next, &mut buf).unwrap();
+
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("current project"),
+            "current task missing: {out}"
+        );
+        assert!(!out.contains("other project"), "other task leaked: {out}");
+        assert!(db::get_task(&conn, current.id).unwrap().done);
+        assert!(!db::get_task(&conn, other.id).unwrap().done);
     }
 
     #[test]
